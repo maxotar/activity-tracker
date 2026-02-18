@@ -1,11 +1,14 @@
 #include <stdio.h>
 #include <zephyr/kernel.h>
+#include <errno.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <bluetooth/services/lbs.h>
+#include <bluetooth/services/nus.h>
 #include <zephyr/bluetooth/services/dis.h>
 
 /* ----------------- Hardware Setup ----------------- */
@@ -15,8 +18,9 @@
 #define IMU_ACCEL_FS_MS2_VAL2 906400
 #define IMU_GYRO_FS_RAD_VAL1 34 /* 2000 dps ~= 34.906585 rad/s */
 #define IMU_GYRO_FS_RAD_VAL2 906585
-#define IMU_NEAR_LIMIT_NUM 9
-#define IMU_NEAR_LIMIT_DEN 10
+#define MAIN_LOOP_SLEEP_MS 10
+#define BLE_DIAG_PERIOD_MS 1000
+#define BLE_SEND_PERIOD_MS 100 /* 10 Hz: 1000 / 10 = 100 ms */
 
 #if !DT_NODE_HAS_STATUS(IMU_NODE, okay)
 #error "Onboard IMU device is not available"
@@ -25,6 +29,74 @@
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 static const struct device *const imu = DEVICE_DT_GET(IMU_NODE);
 static bool led_state = true;
+static struct bt_conn *nus_conn;
+static bool nus_notify_enabled;
+static bool nus_tx_ready;
+static uint32_t nus_tx_ok_count;
+static uint32_t nus_tx_enotconn_count;
+static uint32_t nus_tx_eagain_count;
+static uint32_t nus_tx_enomem_count;
+static uint32_t nus_tx_einval_count;
+static uint32_t nus_tx_other_err_count;
+static int last_nus_err;
+
+static void nus_send_enabled_cb(enum bt_nus_send_status status)
+{
+	nus_notify_enabled = (status == BT_NUS_SEND_STATUS_ENABLED);
+	nus_tx_ready = nus_notify_enabled;
+	printf("NUS notify %s\n", nus_notify_enabled ? "enabled" : "disabled");
+}
+
+static void nus_sent_cb(struct bt_conn *conn)
+{
+	ARG_UNUSED(conn);
+	nus_tx_ready = true;
+}
+
+static struct bt_nus_cb nus_callbacks = {
+	.sent = nus_sent_cb,
+	.send_enabled = nus_send_enabled_cb,
+};
+
+static void connected_cb(struct bt_conn *conn, uint8_t err)
+{
+	if (err)
+	{
+		printf("BLE connect failed (err 0x%02x)\n", err);
+		return;
+	}
+
+	if (nus_conn != NULL)
+	{
+		bt_conn_unref(nus_conn);
+	}
+
+	nus_conn = bt_conn_ref(conn);
+	nus_notify_enabled = false;
+	nus_tx_ready = false;
+	printf("BLE connected\n");
+}
+
+static void disconnected_cb(struct bt_conn *conn, uint8_t reason)
+{
+	ARG_UNUSED(conn);
+
+	if (nus_conn != NULL)
+	{
+		bt_conn_unref(nus_conn);
+		nus_conn = NULL;
+	}
+
+	nus_notify_enabled = false;
+	nus_tx_ready = false;
+
+	printf("BLE disconnected (reason 0x%02x)\n", reason);
+}
+
+BT_CONN_CB_DEFINE(conn_callbacks) = {
+	.connected = connected_cb,
+	.disconnected = disconnected_cb,
+};
 
 static int imu_configure_for_dog_motion(const struct device *imu_dev)
 {
@@ -69,43 +141,24 @@ static int imu_configure_for_dog_motion(const struct device *imu_dev)
 	return ret;
 }
 
-static void sensor_value_to_milli_str(const struct sensor_value *value, char *out, size_t out_len)
+static void sensor_value_to_tenth_str(const struct sensor_value *value, char *out, size_t out_len)
 {
 	int64_t micro = (int64_t)value->val1 * 1000000LL + value->val2;
 	bool negative = micro < 0;
+	int64_t tenths;
+	int32_t whole;
+	int32_t frac;
 
 	if (negative)
 	{
 		micro = -micro;
 	}
 
-	snprintk(out, out_len, "%s%lld.%03lld", negative ? "-" : "",
-			 (long long)(micro / 1000000LL),
-			 (long long)((micro % 1000000LL) / 1000LL));
-}
+	tenths = (micro + 50000LL) / 100000LL;
+	whole = (int32_t)(tenths / 10LL);
+	frac = (int32_t)(tenths % 10LL);
 
-static int64_t sensor_value_abs_micro(const struct sensor_value *value)
-{
-	int64_t micro = (int64_t)value->val1 * 1000000LL + value->val2;
-
-	return micro < 0 ? -micro : micro;
-}
-
-static char axis_limit_flag(const struct sensor_value *value, int64_t full_scale_micro)
-{
-	int64_t abs_micro = sensor_value_abs_micro(value);
-
-	if (abs_micro >= full_scale_micro)
-	{
-		return 'X';
-	}
-
-	if (abs_micro * IMU_NEAR_LIMIT_DEN >= full_scale_micro * IMU_NEAR_LIMIT_NUM)
-	{
-		return '!';
-	}
-
-	return '.';
+	snprintk(out, out_len, "%s%d.%d", negative ? "-" : "", whole, frac);
 }
 
 /* ----------------- LBS Callbacks ----------------- */
@@ -132,13 +185,20 @@ static struct bt_lbs_cb lbs_callbacks = {
 /* ----------------- Advertising Data ----------------- */
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_VAL),
 	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
+};
+
+static const struct bt_data sd[] = {
 	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_LBS_VAL),
 };
 
 int main(void)
 {
 	int ret;
+	uint16_t send_period_ms = BLE_SEND_PERIOD_MS;
+	uint32_t last_send_ms = 0;
+	uint32_t last_diag_ms = 0;
 
 	/* Hardware Init */
 	if (!gpio_is_ready_dt(&led))
@@ -172,8 +232,15 @@ int main(void)
 
 	printf("Bluetooth initialized.\n");
 
+	ret = bt_nus_init(&nus_callbacks);
+	if (ret)
+	{
+		printf("NUS init failed (err %d)\n", ret);
+		return 0;
+	}
+
 	/* Advertising Start */
-	ret = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), NULL, 0);
+	ret = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
 	if (ret)
 	{
 		printf("Advertising failed to start (err %d)\n", ret);
@@ -196,20 +263,45 @@ int main(void)
 	}
 
 	printf("IMU streaming at 104 Hz, accel=16g, gyro=2000dps\n");
-	printf("ACC [m/s^2]                     | GYR [rad/s]                      | FLAGS\n");
-	printf("X        Y        Z             | X        Y        Z              | Axyz Gxyz\n");
+	printf("BLE UART output: 3-axis accel at 10 Hz, numeric CSV format\n");
+	// printf("ACC [m/s^2]                     | GYR [rad/s]                      | FLAGS\n");
+	// printf("X        Y        Z             | X        Y        Z              | Axyz Gxyz\n");
+
+	last_send_ms = k_uptime_get_32();
+	last_diag_ms = last_send_ms;
 
 	/* Main loop */
 	while (1)
 	{
 		struct sensor_value ax, ay, az;
-		struct sensor_value gx, gy, gz;
-		char ax_str[20], ay_str[20], az_str[20];
-		char gx_str[20], gy_str[20], gz_str[20];
-		char afx, afy, afz;
-		char gfx, gfy, gfz;
-		int64_t accel_fs_micro;
-		int64_t gyro_fs_micro;
+		char ax_str[16], ay_str[16], az_str[16];
+		char nus_row[120];
+		int nus_len;
+		uint32_t now_ms = k_uptime_get_32();
+
+		if (now_ms - last_send_ms < send_period_ms)
+		{
+			if (now_ms - last_diag_ms >= BLE_DIAG_PERIOD_MS)
+			{
+				last_diag_ms = now_ms;
+				printf("BLE diag: conn=%s notify=%s tx_ready=%s tx_ok=%u enotconn=%u eagain=%u enomem=%u einval=%u other=%u last=%d rate=%uHz\n",
+					   (nus_conn != NULL) ? "yes" : "no",
+					   nus_notify_enabled ? "on" : "off",
+					   nus_tx_ready ? "yes" : "no",
+					   nus_tx_ok_count,
+					   nus_tx_enotconn_count,
+					   nus_tx_eagain_count,
+					   nus_tx_enomem_count,
+					   nus_tx_einval_count,
+					   nus_tx_other_err_count,
+					   last_nus_err,
+					   1000U / send_period_ms);
+			}
+
+			k_sleep(K_MSEC(MAIN_LOOP_SLEEP_MS));
+			continue;
+		}
+		last_send_ms = now_ms;
 
 		ret = sensor_sample_fetch(imu);
 		if (ret < 0)
@@ -222,9 +314,6 @@ int main(void)
 		ret = sensor_channel_get(imu, SENSOR_CHAN_ACCEL_X, &ax);
 		ret |= sensor_channel_get(imu, SENSOR_CHAN_ACCEL_Y, &ay);
 		ret |= sensor_channel_get(imu, SENSOR_CHAN_ACCEL_Z, &az);
-		ret |= sensor_channel_get(imu, SENSOR_CHAN_GYRO_X, &gx);
-		ret |= sensor_channel_get(imu, SENSOR_CHAN_GYRO_Y, &gy);
-		ret |= sensor_channel_get(imu, SENSOR_CHAN_GYRO_Z, &gz);
 		if (ret < 0)
 		{
 			printf("IMU channel read failed (err %d)\n", ret);
@@ -232,27 +321,72 @@ int main(void)
 			continue;
 		}
 
-		sensor_value_to_milli_str(&ax, ax_str, sizeof(ax_str));
-		sensor_value_to_milli_str(&ay, ay_str, sizeof(ay_str));
-		sensor_value_to_milli_str(&az, az_str, sizeof(az_str));
-		sensor_value_to_milli_str(&gx, gx_str, sizeof(gx_str));
-		sensor_value_to_milli_str(&gy, gy_str, sizeof(gy_str));
-		sensor_value_to_milli_str(&gz, gz_str, sizeof(gz_str));
+		sensor_value_to_tenth_str(&ax, ax_str, sizeof(ax_str));
+		sensor_value_to_tenth_str(&ay, ay_str, sizeof(ay_str));
+		sensor_value_to_tenth_str(&az, az_str, sizeof(az_str));
 
-		accel_fs_micro = (int64_t)IMU_ACCEL_FS_MS2_VAL1 * 1000000LL + IMU_ACCEL_FS_MS2_VAL2;
-		gyro_fs_micro = (int64_t)IMU_GYRO_FS_RAD_VAL1 * 1000000LL + IMU_GYRO_FS_RAD_VAL2;
-		afx = axis_limit_flag(&ax, accel_fs_micro);
-		afy = axis_limit_flag(&ay, accel_fs_micro);
-		afz = axis_limit_flag(&az, accel_fs_micro);
-		gfx = axis_limit_flag(&gx, gyro_fs_micro);
-		gfy = axis_limit_flag(&gy, gyro_fs_micro);
-		gfz = axis_limit_flag(&gz, gyro_fs_micro);
+		if (nus_conn != NULL && nus_notify_enabled && nus_tx_ready)
+		{
+			nus_len = snprintk(nus_row, sizeof(nus_row),
+							   "%s,%s,%s\n",
+							   ax_str, ay_str, az_str);
+			if (nus_len > 0)
+			{
+				nus_tx_ready = false;
+				ret = bt_nus_send(nus_conn, (const uint8_t *)nus_row, (uint16_t)nus_len);
+				if (ret == 0)
+				{
+					nus_tx_ok_count++;
+				}
+				else if (ret == -ENOTCONN)
+				{
+					nus_tx_enotconn_count++;
+					nus_tx_ready = true;
+				}
+				else if (ret == -EAGAIN)
+				{
+					nus_tx_eagain_count++;
+					nus_tx_ready = true;
+				}
+				else if (ret == -ENOMEM)
+				{
+					nus_tx_enomem_count++;
+					nus_tx_ready = true;
+				}
+				else if (ret == -EINVAL)
+				{
+					nus_tx_einval_count++;
+					nus_notify_enabled = false;
+					nus_tx_ready = false;
+					last_nus_err = ret;
+				}
+				else
+				{
+					nus_tx_other_err_count++;
+					nus_tx_ready = true;
+					last_nus_err = ret;
+				}
+			}
+		}
 
-		printf("%8s %8s %8s | %8s %8s %8s |  %c%c%c  %c%c%c\n",
-			   ax_str, ay_str, az_str, gx_str, gy_str, gz_str,
-			   afx, afy, afz, gfx, gfy, gfz);
+		if (now_ms - last_diag_ms >= BLE_DIAG_PERIOD_MS)
+		{
+			last_diag_ms = now_ms;
+			printf("BLE diag: conn=%s notify=%s tx_ready=%s tx_ok=%u enotconn=%u eagain=%u enomem=%u einval=%u other=%u last=%d rate=%uHz\n",
+				   (nus_conn != NULL) ? "yes" : "no",
+				   nus_notify_enabled ? "on" : "off",
+				   nus_tx_ready ? "yes" : "no",
+				   nus_tx_ok_count,
+				   nus_tx_enotconn_count,
+				   nus_tx_eagain_count,
+				   nus_tx_enomem_count,
+				   nus_tx_einval_count,
+				   nus_tx_other_err_count,
+				   last_nus_err,
+				   1000U / send_period_ms);
+		}
 
-		k_sleep(K_USEC(9615));
+		k_sleep(K_MSEC(MAIN_LOOP_SLEEP_MS));
 	}
 	return 0;
 }
