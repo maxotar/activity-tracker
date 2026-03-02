@@ -1,8 +1,12 @@
+#include <Arduino.h>
 #include "LSM6DS3.h"
 #include "Wire.h"
 
 // IMU instance
 LSM6DS3 myIMU(I2C_MODE, 0x6A);
+
+volatile bool fifoReady = false;
+const int interruptPin = PIN_LSM6DS3TR_C_INT1;
 
 // Configuration
 #define ODR_HZ 52
@@ -23,6 +27,12 @@ struct DataPoint
 #define MAX_SAMPLES 15000
 DataPoint dataLog[MAX_SAMPLES];
 uint16_t currentSample = 0;
+
+// This function runs the instant the INT1 pin goes HIGH
+void onFifoWatermark()
+{
+    fifoReady = true;
+}
 
 // Compute functions
 uint16_t computeRMS(float *data, int n)
@@ -101,6 +111,16 @@ void setupIMU()
     myIMU.writeRegister(LSM6DS3_ACC_GYRO_FIFO_CTRL2, (watermark >> 8) & 0x0F);
 
     Serial.println("IMU configured!");
+
+    // 1. Route FIFO Watermark to INT1 pin
+    // Register INT1_CTRL (0x0D), Bit 3 is INT1_FTH (FIFO Threshold)
+    myIMU.writeRegister(LSM6DS3_ACC_GYRO_INT1_CTRL, 0x08);
+
+    // 2. Make the interrupt "Latched" (Optional but recommended)
+    // This keeps the INT pin high until we read the FIFO
+    myIMU.writeRegister(LSM6DS3_ACC_GYRO_TAP_CFG1, 0x01);
+
+    Serial.println("IMU Interrupts configured!");
 }
 
 void setup()
@@ -124,6 +144,9 @@ void setup()
 
     setupIMU();
 
+    pinMode(interruptPin, INPUT);
+    attachInterrupt(digitalPinToInterrupt(interruptPin), onFifoWatermark, RISING);
+
     Serial.print("\nStorage capacity: ");
     Serial.print(MAX_SAMPLES);
     Serial.println(" logs");
@@ -139,24 +162,31 @@ void setup()
 
     Serial.println("\nWaiting for FIFO to fill (~10 seconds)...\n");
 }
+
 void loop()
 {
-    Serial.print("Waiting for FIFO... ");
+    Serial.println("MCU going to sleep... zzz");
 
-    // Wait for the FIFO to fill with our target number of words
-    uint16_t fifoWords = 0;
-    while (fifoWords < FIFO_WORDS)
+    // Clear the flag before sleeping
+    fifoReady = false;
+
+    // Power Management for nRF52840
+    // We stay in this while loop until the ISR sets fifoReady to true
+    while (!fifoReady)
     {
-        fifoWords = getFIFOSamples(); // This is returning words, not full XYZ samples
-        delay(100);
+        // This command puts the nRF52840 into System ON Low Power Mode.
+        // It stays here until ANY interrupt occurs.
+        __WFE(); // Wait For Event
+        __SEV(); // Set Event (Standard ARM power-down sequence)
+        __WFE();
     }
 
-    Serial.println("FULL!");
+    Serial.println("WOKE UP! Processing FIFO...");
 
+    // Now that we are awake, perform FIFO reading math
     float accelMag[SAMPLES_PER_WINDOW];
-    Serial.print("Reading FIFO... ");
 
-    // Read the exact number of 3-axis samples
+    // IMPORTANT: Reading the FIFO automatically clears the interrupt pin
     for (int i = 0; i < SAMPLES_PER_WINDOW; i++)
     {
         uint8_t lsb, msb;
@@ -220,4 +250,6 @@ void loop()
     Serial.print(tempF_x10 % 10);
     Serial.println("°F");
     Serial.println();
+
+    Serial.println("Data processed. Returning to sleep.");
 }
